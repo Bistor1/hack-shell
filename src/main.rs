@@ -43,6 +43,7 @@ struct Soft {
 }
 
 struct App {
+    wake: winit::event_loop::EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     soft: Option<Soft>,
     egui_textures: std::collections::HashMap<egui::TextureId, CpuImage>,
@@ -69,6 +70,7 @@ struct App {
     dragging_split: Option<Vec<usize>>,
     scale: f32,
     profile_index: usize,
+    should_quit: bool,
 }
 
 struct Tab {
@@ -94,6 +96,7 @@ struct Splitter {
 impl App {
     fn new(wake: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
         Self {
+            wake: wake.clone(),
             window: None,
             soft: None,
             egui_textures: std::collections::HashMap::new(),
@@ -120,6 +123,7 @@ impl App {
             dragging_split: None,
             scale: 1.0,
             profile_index: 0,
+            should_quit: false,
         }
     }
 
@@ -146,6 +150,10 @@ impl App {
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("software surface");
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals::dark());
+        let wake = self.wake.clone();
+        egui_ctx.set_request_repaint_callback(move |_| {
+            let _ = wake.send_event(UserEvent::Wake);
+        });
         let egui = EguiState::new(
             egui_ctx,
             egui::ViewportId::ROOT,
@@ -774,8 +782,8 @@ impl App {
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
-                        self.sessions.shutdown_all();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.should_quit = true;
+                        ui.close();
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -1039,17 +1047,14 @@ impl App {
     fn bookmark_window(&mut self, ctx: &egui::Context) {
         let mut open = self.bookmarks_open;
         let mut remove = None;
+        let mut open_here: Option<(String, String)> = None;
         egui::Window::new("Bookmarks").open(&mut open).show(ctx, |ui| {
             for (i, mark) in self.config.bookmarks.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut mark.name);
                     ui.text_edit_singleline(&mut mark.directory);
                     if ui.button("Open").clicked() {
-                        let mut profile = Profile::default();
-                        profile.working_directory = mark.directory.clone();
-                        profile.command = mark.command.clone();
-                        // Can't call new_tab while borrowing bookmarks. Flag via command later.
-                        let _ = profile;
+                        open_here = Some((mark.directory.clone(), mark.command.clone()));
                     }
                     if ui.button("Delete").clicked() {
                         remove = Some(i);
@@ -1060,6 +1065,14 @@ impl App {
                 let _ = self.config.save();
             }
         });
+        if let Some((dir, cmd)) = open_here {
+            let mut profile = self.profile();
+            profile.working_directory = dir;
+            if !cmd.is_empty() {
+                profile.command = cmd;
+            }
+            self.new_tab(Some(profile), None);
+        }
         if let Some(i) = remove {
             self.config.bookmarks.remove(i);
             let _ = self.config.save();
@@ -1539,7 +1552,16 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else { return };
-        let consumed = self.egui.as_mut().map(|e| e.on_window_event(&window, &event).consumed).unwrap_or(false);
+        let response = self.egui.as_mut().map(|e| e.on_window_event(&window, &event));
+        let consumed = response.map(|r| r.consumed).unwrap_or(false);
+        if response.map(|r| r.repaint).unwrap_or(false) {
+            window.request_redraw();
+        }
+        if self.should_quit {
+            self.sessions.shutdown_all();
+            event_loop.exit();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.sessions.shutdown_all();

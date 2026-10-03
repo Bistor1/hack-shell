@@ -400,7 +400,8 @@ fn raster_tri(
             let w0 = edge(p1, p2, p) / area;
             let w1 = edge(p2, p0, p) / area;
             let w2 = edge(p0, p1, p) / area;
-            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+            // egui does not keep a consistent triangle winding.
+            if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
                 continue;
             }
             let mut r = w0 * c0[0] as f32 + w1 * c1[0] as f32 + w2 * c2[0] as f32;
