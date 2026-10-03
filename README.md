@@ -1,6 +1,6 @@
 # hack-shell
 
-A GPU terminal for EndeavourOS / Plasma Wayland. Cells are drawn as instanced quads on the GPU (Vulkan, Intel iGPU preferred). Selecting text publishes it on the Wayland **primary selection**, so another window can paste it with a middle click. Copy-on-select also fills the normal clipboard.
+A CPU terminal for EndeavourOS / Plasma Wayland. Cells are painted in software, so it stays responsive on hybrid Intel/NVIDIA machines. Selecting text publishes it on the Wayland **primary selection**, so another window can paste it with a middle click. Copy-on-select also fills the normal clipboard.
 
 ## Build
 

@@ -1,11 +1,9 @@
-//! Cell renderer. Glyphs are rasterized once into an atlas; every visible cell
-//! is an instanced quad drawn by the GPU.
+//! CPU cell painter. Glyphs are rasterized once into an atlas and blitted
+//! into a software framebuffer. No GPU is involved.
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::process::Command;
 
-use bytemuck::{Pod, Zeroable};
 use fontdue::{Font, FontSettings};
 
 const ATLAS: u32 = 2048;
@@ -36,9 +34,6 @@ pub struct Fonts {
     cursor_y: u32,
     row_h: u32,
     glyphs: HashMap<GlyphKey, Glyph>,
-    dirty: bool,
-    texture: Option<wgpu::Texture>,
-    pub epoch: u64,
 }
 
 impl Fonts {
@@ -60,9 +55,6 @@ impl Fonts {
             cursor_y: 1,
             row_h: 0,
             glyphs: HashMap::new(),
-            dirty: true,
-            texture: None,
-            epoch: 1,
         };
         fonts.measure();
         fonts
@@ -78,7 +70,6 @@ impl Fonts {
         self.cursor_x = 1;
         self.cursor_y = 1;
         self.row_h = 0;
-        self.dirty = true;
         self.measure();
     }
 
@@ -124,7 +115,6 @@ impl Fonts {
                 self.row_h = 0;
             }
             if self.cursor_y + gh + 1 >= ATLAS {
-                // Atlas exhausted: reset and keep going. Rare for a terminal.
                 self.atlas.fill(0);
                 self.glyphs.clear();
                 self.cursor_x = 1;
@@ -144,51 +134,10 @@ impl Fonts {
             };
             self.cursor_x += gw + 1;
             self.row_h = self.row_h.max(gh);
-            self.dirty = true;
             g
         };
         self.glyphs.insert(key, glyph);
         glyph
-    }
-
-    pub fn texture(&self) -> &wgpu::Texture {
-        self.texture.as_ref().expect("atlas uploaded")
-    }
-
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> u64 {
-        if self.texture.is_none() {
-            self.epoch += 1;
-            self.texture = Some(device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("glyph-atlas"),
-                size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            }));
-            self.dirty = true;
-        }
-        if self.dirty {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: self.texture.as_ref().unwrap(),
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.atlas,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(ATLAS),
-                    rows_per_image: Some(ATLAS),
-                },
-                wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
-            );
-            self.dirty = false;
-        }
-        self.epoch
     }
 }
 
@@ -199,7 +148,7 @@ fn load_face(family: &str, extra: &str) -> Font {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .filter(|s| !s.is_empty() && !s.contains("\n"));
+        .filter(|s| !s.is_empty() && !s.contains('\n'));
     let bytes = path
         .as_deref()
         .and_then(|p| std::fs::read(p).ok())
@@ -208,23 +157,12 @@ fn load_face(family: &str, extra: &str) -> Font {
     Font::from_bytes(bytes, FontSettings::default()).expect("parse font")
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy)]
 pub struct Instance {
     pub rect: [f32; 4],
     pub uv: [f32; 4],
     pub color: [f32; 4],
     pub kind: f32,
-    pub _pad: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Uniforms {
-    screen: [f32; 2],
-    atlas: [f32; 2],
-    premultiply: f32,
-    _pad: f32,
 }
 
 pub struct DrawList {
@@ -258,253 +196,267 @@ impl DrawList {
         if w < 0.5 || h < 0.5 {
             return;
         }
-        self.push(Instance {
-            rect: [x, y, w, h],
-            uv: [0.0; 4],
-            color,
-            kind: 0.0,
-            _pad: [0.0; 3],
-        });
+        self.push(Instance { rect: [x, y, w, h], uv: [0.0; 4], color, kind: 0.0 });
     }
 
     pub fn glyph(&mut self, x: f32, y: f32, g: Glyph, color: [f32; 4]) {
         if g.size[0] < 0.5 || g.size[1] < 0.5 {
             return;
         }
-        self.push(Instance {
-            rect: [x, y, g.size[0], g.size[1]],
-            uv: g.uv,
-            color,
-            kind: 1.0,
-            _pad: [0.0; 3],
-        });
+        self.push(Instance { rect: [x, y, g.size[0], g.size[1]], uv: g.uv, color, kind: 1.0 });
     }
 }
 
-pub struct Pipeline {
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    uniform_buf: wgpu::Buffer,
-    instance_buf: wgpu::Buffer,
-    instance_cap: usize,
-    bind_group: Option<wgpu::BindGroup>,
-    atlas_epoch: u64,
+pub struct CpuImage {
+    pub w: usize,
+    pub h: usize,
+    pub px: Vec<[u8; 4]>,
 }
 
-impl Pipeline {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cells"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cells"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cells"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cells"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x4,
-                        1 => Float32x4,
-                        2 => Float32x4,
-                        3 => Float32
-                    ],
-                })],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let instance_cap = 8192;
-        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instances"),
-            size: (instance_cap * std::mem::size_of::<Instance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        Self {
-            pipeline,
-            layout,
-            sampler,
-            uniform_buf,
-            instance_buf,
-            instance_cap,
-            bind_group: None,
-            atlas_epoch: 0,
+pub fn apply_image_delta(
+    textures: &mut HashMap<egui::TextureId, CpuImage>,
+    id: egui::TextureId,
+    delta: &egui::epaint::ImageDelta,
+) {
+    let egui::epaint::ImageData::Color(image) = &delta.image;
+    let patch: Vec<[u8; 4]> = image.pixels.iter().map(|c| c.to_array()).collect();
+    let [pw, ph] = image.size;
+    if let Some([x, y]) = delta.pos {
+        let Some(tex) = textures.get_mut(&id) else { return };
+        for row in 0..ph {
+            let dy = y + row;
+            if dy >= tex.h {
+                break;
+            }
+            for col in 0..pw {
+                let dx = x + col;
+                if dx >= tex.w {
+                    break;
+                }
+                tex.px[dy * tex.w + dx] = patch[row * pw + col];
+            }
+        }
+    } else {
+        textures.insert(id, CpuImage { w: pw, h: ph, px: patch });
+    }
+}
+
+/// Paint terminal cells into an XRGB framebuffer (`0x00RRGGBB`).
+pub fn paint_cells(fonts: &Fonts, list: &DrawList, width: u32, height: u32, pixels: &mut [u32]) {
+    let width = width as i32;
+    let height = height as i32;
+    for range in &list.ranges {
+        let x0 = range.scissor[0] as i32;
+        let y0 = range.scissor[1] as i32;
+        let x1 = x0 + range.scissor[2] as i32;
+        let y1 = y0 + range.scissor[3] as i32;
+        let end = (range.start + range.count) as usize;
+        for inst in &list.instances[range.start as usize..end.min(list.instances.len())] {
+            if inst.kind < 0.5 {
+                fill_rect(pixels, width, height, inst.rect, inst.color, x0, y0, x1, y1);
+            } else {
+                blit_glyph(fonts, pixels, width, height, inst, x0, y0, x1, y1);
+            }
         }
     }
+}
 
-    pub fn draw(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'_>,
-        atlas_epoch: u64,
-        atlas: &wgpu::Texture,
-        screen: [f32; 2],
-        premultiply: bool,
-        list: &DrawList,
-    ) {
-        if self.bind_group.is_none() || self.atlas_epoch != atlas_epoch {
-            let view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cells"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            }));
-            self.atlas_epoch = atlas_epoch;
-        }
-        queue.write_buffer(
-            &self.uniform_buf,
-            0,
-            bytemuck::bytes_of(&Uniforms {
-                screen,
-                atlas: [ATLAS as f32, ATLAS as f32],
-                premultiply: if premultiply { 1.0 } else { 0.0 },
-                _pad: 0.0,
-            }),
-        );
-        if list.instances.is_empty() {
-            return;
-        }
-        if list.instances.len() > self.instance_cap {
-            self.instance_cap = list.instances.len().next_power_of_two();
-            self.instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: (self.instance_cap * std::mem::size_of::<Instance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&list.instances));
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
-        pass.set_vertex_buffer(0, self.instance_buf.slice(..));
-        for range in &list.ranges {
-            if range.count == 0 || range.scissor[2] == 0 || range.scissor[3] == 0 {
+pub fn paint_egui(
+    jobs: &[egui::ClippedPrimitive],
+    textures: &HashMap<egui::TextureId, CpuImage>,
+    ppp: f32,
+    width: u32,
+    height: u32,
+    pixels: &mut [u32],
+) {
+    for job in jobs {
+        let egui::epaint::Primitive::Mesh(mesh) = &job.primitive else { continue };
+        let clip = job.clip_rect;
+        let clip = [
+            (clip.min.x * ppp) as i32,
+            (clip.min.y * ppp) as i32,
+            (clip.max.x * ppp) as i32,
+            (clip.max.y * ppp) as i32,
+        ];
+        let tex = textures.get(&mesh.texture_id);
+        let tris = mesh.indices.len() / 3;
+        for t in 0..tris {
+            let i0 = mesh.indices[t * 3] as usize;
+            let i1 = mesh.indices[t * 3 + 1] as usize;
+            let i2 = mesh.indices[t * 3 + 2] as usize;
+            if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
                 continue;
             }
-            pass.set_scissor_rect(range.scissor[0], range.scissor[1], range.scissor[2], range.scissor[3]);
-            pass.draw(0..6, range.start..range.start + range.count);
+            raster_tri(pixels, width, height, ppp, tex, &mesh.vertices[i0], &mesh.vertices[i1], &mesh.vertices[i2], clip);
         }
     }
 }
 
-const SHADER: &str = r#"
-struct Uniforms {
-    screen: vec2<f32>,
-    atlas: vec2<f32>,
-    premultiply: f32,
-    _pad: f32,
-};
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) kind: f32,
-};
-struct Instance {
-    @location(0) rect: vec4<f32>,
-    @location(1) uv: vec4<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) kind: f32,
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var atlas_tex: texture_2d<f32>;
-@group(0) @binding(2) var atlas_samp: sampler;
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0)
-    );
-    let c = corners[vi];
-    let px = inst.rect.xy + c * inst.rect.zw;
-    let ndc = vec2<f32>(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
-    let uv = inst.uv.xy + c * inst.uv.zw;
-    return VsOut(vec4<f32>(ndc, 0.0, 1.0), uv, inst.color, inst.kind);
+fn fill_rect(pixels: &mut [u32], width: i32, height: i32, rect: [f32; 4], color: [f32; 4], sx0: i32, sy0: i32, sx1: i32, sy1: i32) {
+    let x0 = (rect[0].floor() as i32).max(sx0).max(0);
+    let y0 = (rect[1].floor() as i32).max(sy0).max(0);
+    let x1 = ((rect[0] + rect[2]).ceil() as i32).min(sx1).min(width);
+    let y1 = ((rect[1] + rect[3]).ceil() as i32).min(sy1).min(height);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let src = pack(color);
+    let a = (color[3] * 255.0) as u32;
+    if a >= 250 {
+        for y in y0..y1 {
+            let row = &mut pixels[(y * width) as usize + x0 as usize..(y * width) as usize + x1 as usize];
+            row.fill(src);
+        }
+        return;
+    }
+    if a == 0 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * width + x) as usize;
+            pixels[i] = blend(pixels[i], src, a);
+        }
+    }
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var color = in.color;
-    if (in.kind > 0.5) {
-        let cov = textureSample(atlas_tex, atlas_samp, in.uv / u.atlas).r;
-        color = vec4<f32>(in.color.rgb, in.color.a * cov);
+fn blit_glyph(fonts: &Fonts, pixels: &mut [u32], width: i32, height: i32, inst: &Instance, sx0: i32, sy0: i32, sx1: i32, sy1: i32) {
+    let gw = inst.uv[2] as i32;
+    let gh = inst.uv[3] as i32;
+    if gw <= 0 || gh <= 0 {
+        return;
     }
-    if (u.premultiply > 0.5) {
-        color = vec4<f32>(color.rgb * color.a, color.a);
+    let x0 = inst.rect[0].floor() as i32;
+    let y0 = inst.rect[1].floor() as i32;
+    let cr = (inst.color[0] * 255.0) as u32;
+    let cg = (inst.color[1] * 255.0) as u32;
+    let cb = (inst.color[2] * 255.0) as u32;
+    let au = inst.uv[0] as i32;
+    let av = inst.uv[1] as i32;
+    for row in 0..gh {
+        let y = y0 + row;
+        if y < sy0 || y >= sy1 || y < 0 || y >= height {
+            continue;
+        }
+        let atlas_row = (av + row) as u32;
+        if atlas_row >= ATLAS {
+            break;
+        }
+        for col in 0..gw {
+            let x = x0 + col;
+            if x < sx0 || x >= sx1 || x < 0 || x >= width {
+                continue;
+            }
+            let atlas_col = (au + col) as u32;
+            if atlas_col >= ATLAS {
+                break;
+            }
+            let cov = fonts.atlas[(atlas_row * ATLAS + atlas_col) as usize] as u32;
+            if cov == 0 {
+                continue;
+            }
+            let src = (cr << 16) | (cg << 8) | cb;
+            let i = (y * width + x) as usize;
+            pixels[i] = blend(pixels[i], src, cov);
+        }
     }
-    return color;
 }
-"#;
+
+fn raster_tri(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    ppp: f32,
+    tex: Option<&CpuImage>,
+    v0: &egui::epaint::Vertex,
+    v1: &egui::epaint::Vertex,
+    v2: &egui::epaint::Vertex,
+    clip: [i32; 4],
+) {
+    let p0 = [v0.pos.x * ppp, v0.pos.y * ppp];
+    let p1 = [v1.pos.x * ppp, v1.pos.y * ppp];
+    let p2 = [v2.pos.x * ppp, v2.pos.y * ppp];
+    let min_x = p0[0].min(p1[0]).min(p2[0]).floor() as i32;
+    let min_y = p0[1].min(p1[1]).min(p2[1]).floor() as i32;
+    let max_x = p0[0].max(p1[0]).max(p2[0]).ceil() as i32;
+    let max_y = p0[1].max(p1[1]).max(p2[1]).ceil() as i32;
+    let x0 = min_x.max(clip[0]).max(0);
+    let y0 = min_y.max(clip[1]).max(0);
+    let x1 = max_x.min(clip[2]).min(width as i32);
+    let y1 = max_y.min(clip[3]).min(height as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let area = edge(p0, p1, p2);
+    if area.abs() < 0.5 {
+        return;
+    }
+    let c0 = v0.color.to_array();
+    let c1 = v1.color.to_array();
+    let c2 = v2.color.to_array();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = [x as f32 + 0.5, y as f32 + 0.5];
+            let w0 = edge(p1, p2, p) / area;
+            let w1 = edge(p2, p0, p) / area;
+            let w2 = edge(p0, p1, p) / area;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+            let mut r = w0 * c0[0] as f32 + w1 * c1[0] as f32 + w2 * c2[0] as f32;
+            let mut g = w0 * c0[1] as f32 + w1 * c1[1] as f32 + w2 * c2[1] as f32;
+            let mut b = w0 * c0[2] as f32 + w1 * c1[2] as f32 + w2 * c2[2] as f32;
+            let mut a = w0 * c0[3] as f32 + w1 * c1[3] as f32 + w2 * c2[3] as f32;
+            if let Some(tex) = tex {
+                let u = w0 * v0.uv.x + w1 * v1.uv.x + w2 * v2.uv.x;
+                let v = w0 * v0.uv.y + w1 * v1.uv.y + w2 * v2.uv.y;
+                let tx = (u * tex.w as f32) as usize;
+                let ty = (v * tex.h as f32) as usize;
+                if tx < tex.w && ty < tex.h {
+                    let sample = tex.px[ty * tex.w + tx];
+                    let ta = sample[3] as f32 / 255.0;
+                    r *= sample[0] as f32 / 255.0;
+                    g *= sample[1] as f32 / 255.0;
+                    b *= sample[2] as f32 / 255.0;
+                    a *= ta;
+                }
+            }
+            let ai = a as u32;
+            if ai == 0 {
+                continue;
+            }
+            let src = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            let i = (y as u32 * width + x as u32) as usize;
+            if ai >= 250 {
+                pixels[i] = src;
+            } else {
+                pixels[i] = blend(pixels[i], src, ai.min(255));
+            }
+        }
+    }
+}
+
+fn edge(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
+}
+
+fn pack(color: [f32; 4]) -> u32 {
+    let r = (color[0] * 255.0) as u32;
+    let g = (color[1] * 255.0) as u32;
+    let b = (color[2] * 255.0) as u32;
+    (r << 16) | (g << 8) | b
+}
+
+fn blend(dst: u32, src: u32, a: u32) -> u32 {
+    let inv = 255 - a;
+    let dr = (dst >> 16) & 255;
+    let dg = (dst >> 8) & 255;
+    let db = dst & 255;
+    let sr = (src >> 16) & 255;
+    let sg = (src >> 8) & 255;
+    let sb = src & 255;
+    let r = sr * a / 255 + dr * inv / 255;
+    let g = sg * a / 255 + dg * inv / 255;
+    let b = sb * a / 255 + db * inv / 255;
+    (r << 16) | (g << 8) | b
+}

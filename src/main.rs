@@ -24,7 +24,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::config::{Bookmark, Config, Profile, Scheme};
-use crate::gpu::{DrawList, Fonts, Pipeline};
+use crate::gpu::{apply_image_delta, paint_cells, paint_egui, CpuImage, DrawList, Fonts};
 use crate::session::Pane;
 
 fn main() {
@@ -38,19 +38,14 @@ fn main() {
     }
 }
 
-struct Gfx {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    pipeline: Pipeline,
-    egui: egui_wgpu::Renderer,
-    premultiply: bool,
+struct Soft {
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
 }
 
 struct App {
     window: Option<Arc<Window>>,
-    gfx: Option<Gfx>,
+    soft: Option<Soft>,
+    egui_textures: std::collections::HashMap<egui::TextureId, CpuImage>,
     egui: Option<EguiState>,
     sessions: Sessions,
     config: Config,
@@ -100,7 +95,8 @@ impl App {
     fn new(wake: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
         Self {
             window: None,
-            gfx: None,
+            soft: None,
+            egui_textures: std::collections::HashMap::new(),
             egui: None,
             sessions: Sessions::new(wake),
             config: Config::load(),
@@ -143,11 +139,11 @@ impl App {
             .with_title("hack-shell")
             .with_inner_size(LogicalSize::new(1080.0, 680.0))
             .with_min_inner_size(LogicalSize::new(320.0, 180.0))
-            .with_transparent(true)
             .with_decorations(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = window.scale_factor() as f32;
-        let gfx = pollster::block_on(Gfx::new(window.clone())).expect("gpu");
+        let context = softbuffer::Context::new(window.clone()).expect("software context");
+        let surface = softbuffer::Surface::new(&context, window.clone()).expect("software surface");
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals::dark());
         let egui = EguiState::new(
@@ -161,7 +157,7 @@ impl App {
         let profile = self.profile();
         self.fonts = Some(Fonts::load(&profile.font_family, profile.font_size));
         self.window = Some(window);
-        self.gfx = Some(gfx);
+        self.soft = Some(Soft { surface });
         self.egui = Some(egui);
         self.new_tab(None, None);
     }
@@ -1099,15 +1095,6 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        {
-            let gfx = self.gfx.as_mut().unwrap();
-            if gfx.config.width != size.width || gfx.config.height != size.height {
-                gfx.config.width = size.width;
-                gfx.config.height = size.height;
-                gfx.surface.configure(&gfx.device, &gfx.config);
-            }
-        }
-
         let mut egui_state = self.egui.take().unwrap();
         let raw = egui_state.take_egui_input(&window);
         let ctx = egui_state.egui_ctx().clone();
@@ -1117,79 +1104,35 @@ impl App {
         self.scale = pixels_per_point;
         let jobs = ctx.tessellate(full.shapes, pixels_per_point);
         self.egui = Some(egui_state);
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [size.width, size.height],
-            pixels_per_point,
-        };
-        {
-            let gfx = self.gfx.as_mut().unwrap();
-            for (id, deltas) in &full.textures_delta.set {
-                for delta in deltas {
-                    gfx.egui.update_texture(&gfx.device, &gfx.queue, *id, delta);
-                }
+        for (id, deltas) in &full.textures_delta.set {
+            for delta in deltas {
+                apply_image_delta(&mut self.egui_textures, *id, delta);
             }
+        }
+        for id in &full.textures_delta.free {
+            self.egui_textures.remove(id);
         }
 
         self.sync_pane_sizes();
         let list = self.build_draw_list(size);
-        let fonts = self.fonts.as_mut().unwrap();
-        let gfx = self.gfx.as_mut().unwrap();
-        let epoch = fonts.upload(&gfx.device, &gfx.queue);
-        let atlas = fonts.texture();
-
-        let frame = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                gfx.surface.configure(&gfx.device, &gfx.config);
-                return;
-            },
-            other => {
-                log::warn!("surface: {other:?}");
+        let Some(soft) = self.soft.as_mut() else { return };
+        let (Some(w), Some(h)) = (std::num::NonZeroU32::new(size.width), std::num::NonZeroU32::new(size.height)) else { return };
+        if soft.surface.resize(w, h).is_err() {
+            return;
+        }
+        let mut buffer = match soft.surface.buffer_mut() {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                log::warn!("framebuffer: {err}");
                 return;
             },
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = gfx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cells"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            gfx.pipeline.draw(&gfx.device, &gfx.queue, &mut pass, epoch, atlas, [size.width as f32, size.height as f32], gfx.premultiply, &list);
-        }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("egui"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        }).forget_lifetime();
-        let extra = gfx.egui.update_buffers(&gfx.device, &gfx.queue, &mut encoder, &jobs, &screen);
-        gfx.egui.render(&mut pass, &jobs, &screen);
-        drop(pass);
-        gfx.queue.submit(std::iter::once(encoder.finish()).chain(extra));
-        drop(view);
-        gfx.queue.present(frame);
-        for id in &full.textures_delta.free {
-            gfx.egui.free_texture(id);
+        buffer.fill(0x001b1e20);
+        let fonts = self.fonts.as_ref().unwrap();
+        paint_cells(fonts, &list, size.width, size.height, &mut buffer);
+        paint_egui(&jobs, &self.egui_textures, pixels_per_point, size.width, size.height, &mut buffer);
+        if let Err(err) = buffer.present() {
+            log::warn!("present: {err}");
         }
     }
 
@@ -1578,65 +1521,6 @@ trait TakeNode {
 impl TakeNode for Node {
     fn take_placeholder(&mut self) -> Node {
         std::mem::replace(self, Node::Pane(0))
-    }
-}
-
-impl Gfx {
-    async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        let instance = wgpu::Instance::new(desc);
-        let surface = instance.create_surface(window.clone())?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await?;
-        log::info!("GPU: {}", adapter.get_info().name);
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("hack-shell"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
-        let premultiply = caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied);
-        let alpha = if premultiply {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else {
-            caps.alpha_modes[0]
-        };
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: alpha,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-        let pipeline = Pipeline::new(&device, format);
-        let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions {
-            msaa_samples: 1,
-            dithering: false,
-            depth_stencil_format: None,
-            predictable_texture_filtering: false,
-        });
-        Ok(Self { surface, device, queue, config, pipeline, egui, premultiply })
     }
 }
 
